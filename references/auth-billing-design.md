@@ -113,23 +113,29 @@ POST /api/v1/auth/agent-register
 {
   "user_id": "user_xxxxx",
   "master_key": "lm_mk_xxxxxxxxxxxxxxxx",
-  "agent_key": "lm_ak_xxxxxxxxxxxxxxxx"
+  "master_secret": "xxxxx",
+  "agent_key": "lm_ak_xxxxxxxxxxxxxxxx",
+  "agent_secret": "xxxxx"
 }
 ```
+
+> ⚠️ `master_secret` 和 `agent_secret` 仅在注册时明文返回一次，数据库只存哈希，之后无法再获取。
 
 **安全限制：**
 - Rate limit: 同一 IP 每小时最多 5 次注册
 - 新账户余额为 0
-- 返回 Master Key + 一个 Agent Key
+- 返回 Master Key/Secret + 一个 Agent Key/Secret
+- 注册时自动创建钱包（调 transaction-service）
 
 **本地存储：**
 ```json
-// ~/.lobster-market/token.json
+// ~/.lobster-market/master-key.json
 {
   "user_id": "user_xxxxx",
   "master_key": "lm_mk_xxxxxxxxxxxxxxxx",
+  "master_secret": "xxxxx",
   "agent_key": "lm_ak_xxxxxxxxxxxxxxxx",
-  "created_at": "2025-02-10T12:00:00Z"
+  "agent_secret": "xxxxx"
 }
 ```
 文件权限设置为 `600`（仅当前用户可读写）。
@@ -143,31 +149,27 @@ POST /api/v1/auth/login-by-key
 **Request:**
 ```json
 {
-  "api_key": "lm_mk_xxxxxxxxxxxxxxxx"
+  "api_key": "lm_mk_xxxxxxxxxxxxxxxx",
+  "api_secret": "对应的 master_secret"
 }
 ```
 
 **Response:**
 ```json
 {
-  "token": "eyJhbGciOiJIUzI1NiIs...",
-  "user": {
-    "user_id": "user_xxxxx",
-    "email": null,
-    "has_password": false,
-    "created_via": "agent-register"
-  }
+  "access_token": "eyJhbGciOiJIUzI1NiIs...",
+  "refresh_token": "..."
 }
 ```
 
-**限制：** 仅接受 Master Key（`lm_mk_` 前缀）。
+**限制：** 仅接受 Master Key（`lm_mk_` 前缀），必须同时提供 `api_secret`。
 
 ### 4.3 Key 管理
 
 ```
 # 列出所有 Key
 GET /api/v1/keys
-Authorization: Bearer <jwt> 或 X-API-Key: <master_key>
+Authorization: Bearer <jwt> 或 X-API-Key: <key> + X-API-Secret: <secret>
 
 # 创建新 Key
 POST /api/v1/keys

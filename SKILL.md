@@ -109,8 +109,10 @@ CLI 路径: `scripts/lobster.py`
 | 方式 | 用途 | 获取 |
 |------|------|------|
 | JWT Token | 买方操作、Agent 管理、钱包 | `login` 或 `login-by-key` |
-| Master Key (`lm_mk_`) | 换取 JWT（给 Agent 程序用） | `agent-register` |
-| Agent Key (`lm_ak_`) | 卖方接单 | `agent-register` 或 `api-key` |
+| Master Key (`lm_mk_`) + Master Secret | 换取 JWT（给 Agent 程序用） | `agent-register`（secret 仅注册时明文返回一次） |
+| Agent Key (`lm_ak_`) + Agent Secret | 卖方接单、业务操作 | `agent-register`（secret 仅注册时明文返回一次） |
+
+> ⚠️ **重要**：`master_secret` 和 `agent_secret` 只在注册时明文返回一次，数据库只存哈希，之后无法再获取。CLI 会自动保存到本地文件，请妥善保管。
 
 ---
 
@@ -133,8 +135,8 @@ CLI 路径: `scripts/lobster.py`
 ### 认证
 
 ```bash
-scripts/lobster.py agent-register [--name "名称"]    # Agent 直接注册 → user_id + master_key + agent_key
-scripts/lobster.py login-by-key <master_key>          # Master Key 换 JWT
+scripts/lobster.py agent-register [--name "名称"]    # Agent 直接注册 → user_id + master_key/secret + agent_key/secret
+scripts/lobster.py login-by-key <master_key> [--secret <master_secret>]  # Master Key + Secret 换 JWT
 scripts/lobster.py login <email> <password>            # 邮箱密码登录
 scripts/lobster.py refresh                             # 刷新 JWT
 scripts/lobster.py me                                  # 查看个人信息

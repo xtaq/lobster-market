@@ -38,7 +38,7 @@ BASE_HOST = os.environ.get("LOBSTER_HOST", "mindcore8.com")
 LOCAL_MODE = os.environ.get("LOBSTER_LOCAL", "") == "1"
 
 
-def api(method: str, service: str, path: str, body: dict = None, token: str = None, api_key: str = None) -> dict:
+def api(method: str, service: str, path: str, body: dict = None, token: str = None, api_key: str = None, api_secret: str = None) -> dict:
     """发起 API 请求到龙虾市场服务。"""
     if LOCAL_MODE:
         port = PORTS[service]
@@ -48,6 +48,8 @@ def api(method: str, service: str, path: str, body: dict = None, token: str = No
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["X-API-Key"] = api_key
+        if api_secret:
+            headers["X-API-Secret"] = api_secret
     elif token:
         headers["Authorization"] = f"Bearer {token}"
     conn.request(method, path, json.dumps(body) if body else None, headers)
@@ -79,12 +81,12 @@ def save_token(token_data: dict):
     TOKEN_FILE.write_text(json.dumps(token_data, indent=2))
 
 
-def load_api_key() -> str:
-    """加载 API Key。"""
+def load_api_key() -> tuple:
+    """加载 API Key 和 Secret，返回 (key, secret)。"""
     if API_KEY_FILE.exists():
         data = json.loads(API_KEY_FILE.read_text())
-        return data.get("api_key", "")
-    return ""
+        return data.get("api_key", ""), data.get("api_secret", "")
+    return "", ""
 
 
 def save_api_key(key_data: dict):
@@ -102,20 +104,20 @@ def get_token_or_die() -> str:
     return t
 
 
-def get_api_key(args) -> str:
-    """从参数或文件获取 API Key。"""
+def get_api_key(args) -> tuple:
+    """从参数或文件获取 API Key 和 Secret，返回 (key, secret)。"""
     if hasattr(args, "api_key") and args.api_key:
-        return args.api_key
+        return args.api_key, getattr(args, "api_secret_val", "") or ""
     return load_api_key()
 
 
-def get_api_key_or_die(args) -> str:
-    """获取 API Key，没有则退出。"""
-    k = get_api_key(args)
+def get_api_key_or_die(args) -> tuple:
+    """获取 API Key 和 Secret，没有则退出。返回 (key, secret)。"""
+    k, s = get_api_key(args)
     if not k:
         print("🦞 需要 API Key，请先运行: lobster.py api-key 或使用 --api-key 参数", file=sys.stderr)
         sys.exit(1)
-    return k
+    return k, s
 
 
 # ─── 用户命令 ───
@@ -176,26 +178,47 @@ def cmd_agent_register(args):
     if args.name:
         body["agent_name"] = args.name
     result = api("POST", "user", "/api/v1/users/agent-register", body=body)
-    # Save agent key for seller operations
-    save_api_key({"api_key": result.get("agent_key", "")})
-    # Save master key for future login
+    # Save agent key + secret for seller operations
+    save_api_key({
+        "api_key": result.get("agent_key", ""),
+        "api_secret": result.get("agent_secret", ""),
+    })
+    # Save master key + secret for future login
     MASTER_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
     MASTER_KEY_FILE.write_text(json.dumps({
         "user_id": result.get("user_id", ""),
         "master_key": result.get("master_key", ""),
+        "master_secret": result.get("master_secret", ""),
         "agent_key": result.get("agent_key", ""),
+        "agent_secret": result.get("agent_secret", ""),
     }, indent=2))
     print(f"🦞 ✅ Agent 注册成功!")
-    print(f"  User ID:    {result.get('user_id', '?')}")
-    print(f"  Master Key: {result.get('master_key', '?')}")
-    print(f"  Agent Key:  {result.get('agent_key', '?')}")
+    print(f"  User ID:       {result.get('user_id', '?')}")
+    print(f"  Master Key:    {result.get('master_key', '?')}")
+    print(f"  Master Secret: {result.get('master_secret', '?')}")
+    print(f"  Agent Key:     {result.get('agent_key', '?')}")
+    print(f"  Agent Secret:  {result.get('agent_secret', '?')}")
     print(f"  💾 已保存到: {MASTER_KEY_FILE}")
+    print(f"  ⚠️  Secret 只显示一次，请妥善保存！")
     print(f"  💡 用 master key 登录: lobster.py login-by-key {result.get('master_key', '<key>')}")
 
 
 def cmd_login_by_key(args):
-    """🆕 用 Master Key 换 JWT Token。"""
-    result = api("POST", "user", "/api/v1/users/login-by-key", {"api_key": args.api_key_value})
+    """🆕 用 Master Key + Secret 换 JWT Token。"""
+    secret = args.api_secret
+    if not secret:
+        # Try loading from saved master key file
+        if MASTER_KEY_FILE.exists():
+            data = json.loads(MASTER_KEY_FILE.read_text())
+            if data.get("master_key") == args.api_key_value:
+                secret = data.get("master_secret", "")
+        if not secret:
+            print("🦞 需要提供 --secret 参数或确保本地已保存对应的 master_secret", file=sys.stderr)
+            sys.exit(1)
+    result = api("POST", "user", "/api/v1/users/login-by-key", {
+        "api_key": args.api_key_value,
+        "api_secret": secret,
+    })
     save_token(result)
     print(f"🦞 ✅ 登录成功 (via master key)")
 
@@ -205,15 +228,25 @@ def cmd_web_login(args):
     import webbrowser
     # 获取 master key
     mk = args.master_key
+    ms = None
     if not mk:
         if MASTER_KEY_FILE.exists():
             data = json.loads(MASTER_KEY_FILE.read_text())
             mk = data.get("master_key", "")
+            ms = data.get("master_secret", "")
         if not mk:
             print("🦞 需要 master key，请提供参数或先运行 agent-register", file=sys.stderr)
             sys.exit(1)
-    # 用 master key 换 JWT
-    result = api("POST", "user", "/api/v1/users/login-by-key", {"api_key": mk})
+    if not ms:
+        if MASTER_KEY_FILE.exists():
+            data = json.loads(MASTER_KEY_FILE.read_text())
+            if data.get("master_key") == mk:
+                ms = data.get("master_secret", "")
+        if not ms:
+            print("🦞 需要 master_secret，请确保本地已保存或先运行 agent-register", file=sys.stderr)
+            sys.exit(1)
+    # 用 master key + secret 换 JWT
+    result = api("POST", "user", "/api/v1/users/login-by-key", {"api_key": mk, "api_secret": ms})
     save_token(result)
     token = result.get("access_token", "")
     # 用 JWT 生成一次性 login code（30秒有效）
@@ -411,9 +444,9 @@ def cmd_cancel(args):
 
 def cmd_pending(args):
     """卖方查看待处理任务。"""
-    key = get_api_key_or_die(args)
+    key, secret = get_api_key_or_die(args)
     params = f"?agent_id={args.agent_id}" if args.agent_id else ""
-    result = api("GET", "task", f"/api/v1/tasks/pending{params}", api_key=key)
+    result = api("GET", "task", f"/api/v1/tasks/pending{params}", api_key=key, api_secret=secret)
     items = result if isinstance(result, list) else result.get("items", [])
     if not items:
         print("🦞 暂无待处理任务。")
@@ -427,12 +460,12 @@ def cmd_pending(args):
 
 def cmd_accept(args):
     """卖方接受任务并自动开始执行。"""
-    key = get_api_key_or_die(args)
-    api("POST", "task", f"/api/v1/tasks/{args.task_id}/accept", api_key=key)
+    key, secret = get_api_key_or_die(args)
+    api("POST", "task", f"/api/v1/tasks/{args.task_id}/accept", api_key=key, api_secret=secret)
     print(f"🦞 ✅ 已接受任务: {args.task_id}")
     # 自动调 start 进入 running 状态，以便后续 submit-result
     try:
-        api("POST", "task", f"/api/v1/tasks/{args.task_id}/start", api_key=key)
+        api("POST", "task", f"/api/v1/tasks/{args.task_id}/start", api_key=key, api_secret=secret)
         print(f"🦞 🔄 任务已开始执行")
     except SystemExit:
         # start 可能失败（如服务端已自动转为 running），忽略
@@ -441,19 +474,19 @@ def cmd_accept(args):
 
 def cmd_start(args):
     """卖方开始执行任务（assigned → running）。"""
-    key = get_api_key_or_die(args)
-    api("POST", "task", f"/api/v1/tasks/{args.task_id}/start", api_key=key)
+    key, secret = get_api_key_or_die(args)
+    api("POST", "task", f"/api/v1/tasks/{args.task_id}/start", api_key=key, api_secret=secret)
     print(f"🦞 🔄 任务已开始执行: {args.task_id}")
 
 
 def cmd_submit_result(args):
     """卖方提交任务结果。"""
-    key = get_api_key_or_die(args)
+    key, secret = get_api_key_or_die(args)
     output = parse_json(args.output, "输出结果")
     body = {"output": output}
     if args.token_used is not None:
         body["token_used"] = args.token_used
-    api("POST", "task", f"/api/v1/tasks/{args.task_id}/result", body, api_key=key)
+    api("POST", "task", f"/api/v1/tasks/{args.task_id}/result", body, api_key=key, api_secret=secret)
     print(f"🦞 ✅ 结果已提交: {args.task_id}")
 
 
@@ -530,9 +563,9 @@ def cmd_reject_quote(args):
 
 def cmd_pending_quotes(args):
     """卖方查看待报价请求。"""
-    key = get_api_key_or_die(args)
+    key, secret = get_api_key_or_die(args)
     params = f"?agent_id={args.agent_id}" if args.agent_id else ""
-    result = api("GET", "task", f"/api/v1/quotes/pending{params}", api_key=key)
+    result = api("GET", "task", f"/api/v1/quotes/pending{params}", api_key=key, api_secret=secret)
     items = result if isinstance(result, list) else result.get("items", [])
     if not items:
         print("🦞 暂无待报价请求。")
@@ -546,7 +579,7 @@ def cmd_pending_quotes(args):
 
 def cmd_submit_quote(args):
     """卖方提交报价。"""
-    key = get_api_key_or_die(args)
+    key, secret = get_api_key_or_die(args)
     body = {"price": args.price}
     if args.reason:
         body["reason"] = args.reason
@@ -554,7 +587,7 @@ def cmd_submit_quote(args):
         body["estimated_seconds"] = args.estimated_seconds
     if args.ttl:
         body["ttl_seconds"] = args.ttl
-    result = api("POST", "task", f"/api/v1/quotes/{args.quote_id}/submit", body, api_key=key)
+    result = api("POST", "task", f"/api/v1/quotes/{args.quote_id}/submit", body, api_key=key, api_secret=secret)
     print(f"🦞 ✅ 报价已提交: {args.quote_id}")
     print(f"  💰 价格: {args.price} 虾米")
 
@@ -661,8 +694,8 @@ def cmd_webhook(args):
 
 def cmd_poll(args):
     """轮询待处理消息。"""
-    key = get_api_key_or_die(args)
-    result = api("GET", "gateway", f"/api/v1/poll/{args.agent_id}", api_key=key)
+    key, secret = get_api_key_or_die(args)
+    result = api("GET", "gateway", f"/api/v1/poll/{args.agent_id}", api_key=key, api_secret=secret)
     tasks = result.get("tasks", []) if isinstance(result, dict) else result
     if not tasks:
         print("🦞 暂无新消息。")
@@ -674,8 +707,8 @@ def cmd_poll(args):
 
 def cmd_poll_ack(args):
     """确认轮询消息。"""
-    key = get_api_key_or_die(args)
-    api("POST", "gateway", f"/api/v1/poll/{args.agent_id}/ack", {"task_id": args.task_id}, api_key=key)
+    key, secret = get_api_key_or_die(args)
+    api("POST", "gateway", f"/api/v1/poll/{args.agent_id}/ack", {"task_id": args.task_id}, api_key=key, api_secret=secret)
     print(f"🦞 ✅ 消息已确认: {args.task_id}")
 
 
@@ -708,8 +741,9 @@ def main():
     p.add_argument("--name", default=None, help="Agent 名称")
     p.set_defaults(func=cmd_agent_register)
 
-    p = sub.add_parser("login-by-key", help="🆕 用 Master Key 登录")
+    p = sub.add_parser("login-by-key", help="🆕 用 Master Key + Secret 登录")
     p.add_argument("api_key_value", help="Master Key (lm_mk_...)")
+    p.add_argument("--secret", dest="api_secret", default=None, help="Master Secret (可选，默认从本地文件读取)")
     p.set_defaults(func=cmd_login_by_key)
 
     p = sub.add_parser("web-login", help="🌐 生成网页登录链接并打开浏览器")
