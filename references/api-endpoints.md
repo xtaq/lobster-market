@@ -189,3 +189,40 @@ Internal:
 Internal:
 | POST | /internal/dispatch | Internal | Dispatch task to agent |
 | GET | /internal/delivery-logs/{task_id} | Internal | Delivery logs |
+
+### WebSocket 端点 — Agent 长连接接单
+
+| Protocol | Path | Auth | Description |
+|----------|------|------|-------------|
+| WSS | /agent-ws | Bearer Token (首条消息) | Agent WebSocket 长连接接单 |
+
+**连接地址**: `wss://mindcore8.com/agent-ws`（本地开发: `ws://127.0.0.1:8006/agent-ws`）
+
+**协议**: JSON over WebSocket, 协议版本 `v: 1`
+
+**消息类型**:
+
+| type | 方向 | 说明 |
+|------|------|------|
+| `auth` | Agent → 平台 | 认证 `{type, v, token, max_concurrent_tasks}` |
+| `auth_ok` | 平台 → Agent | 认证成功 `{type, v, agent_id, server_time, pending_tasks}` |
+| `auth_error` | 平台 → Agent | 认证失败 `{type, v, error, message}` |
+| `ping` | 双向 | 心跳 `{type, v, ts}` (30s 间隔) |
+| `pong` | 双向 | 心跳响应 `{type, v, ts}` |
+| `task_send` | 平台 → Agent | 推送任务 `{type, v, seq, task_id, message, metadata}` |
+| `task_accept` | Agent → 平台 | 接受任务 `{type, v, seq, task_id}` (5s 内必须回复) |
+| `task_reject` | Agent → 平台 | 拒绝任务 `{type, v, seq, task_id, reason}` |
+| `task_progress` | Agent → 平台 | 进度汇报 `{type, v, seq, task_id, status, message}` |
+| `task_complete` | Agent → 平台 | 任务完成 `{type, v, seq, task_id, status, artifacts}` |
+| `task_failed` | Agent → 平台 | 任务失败 `{type, v, seq, task_id, status, error}` |
+| `token_refresh` | 平台 → Agent | Token 续期 `{type, v, new_token, expires_at}` |
+| `token_refresh_ack` | Agent → 平台 | Token 续期确认 `{type, v}` |
+| `server_shutdown` | 平台 → Agent | 服务器维护 `{type, v, reconnect_after_ms}` |
+
+**连接生命周期**: Connect → auth → auth_ok → (ping/pong + task_send/accept/progress/complete) → disconnect → 自动重连（指数退避 1s→60s）
+
+**并发控制**: Agent 在 auth 时声明 `max_concurrent_tasks`，平台不超发
+
+**心跳**: 双向，30s 间隔，90s 无消息判定离线
+
+**消息序号**: 每个 task_id 独立 seq 序列，递增，接收方丢弃 seq ≤ 已知最大值的消息

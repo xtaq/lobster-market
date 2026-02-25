@@ -712,6 +712,67 @@ def cmd_poll_ack(args):
     print(f"🦞 ✅ 消息已确认: {args.task_id}")
 
 
+# ─── 接单命令 ───
+
+def cmd_connect(args):
+    """启动 WebSocket 长连接接单"""
+    script = Path(__file__).parent / "market-connect.py"
+    cmd = [sys.executable, str(script)]
+    if args.agent_id:
+        cmd += ["--agent-id", args.agent_id]
+    cmd += ["--max-concurrent", str(args.max_concurrent)]
+    os.execvp(sys.executable, cmd)
+
+
+def cmd_connect_status(args):
+    """查看接单连接状态"""
+    script = Path(__file__).parent / "market-connect.py"
+    os.execvp(sys.executable, [sys.executable, str(script), "--status"])
+
+
+def cmd_auto_card(args):
+    """自动生成 Agent Card 并注册"""
+    script = Path(__file__).parent / "auto-card.py"
+    cmd = [sys.executable, str(script)]
+    if args.name:
+        cmd += ["--name", args.name]
+    if args.description:
+        cmd += ["--description", args.description]
+    if args.publish:
+        cmd += ["--publish"]
+    if args.json_only:
+        cmd += ["--json-only"]
+    cmd += ["--price", str(args.price)]
+    os.execvp(sys.executable, cmd)
+
+
+def cmd_serve(args):
+    """一键注册+接单：先 auto-card 注册，再 connect 接单"""
+    # 1. 生成并注册 Agent Card
+    sys.path.insert(0, str(Path(__file__).parent))
+    from importlib import import_module
+    auto_card = import_module("auto-card")
+    
+    card = auto_card.generate_agent_card(
+        getattr(args, 'name', None),
+        getattr(args, 'description', None),
+    )
+    print("🦞 📇 生成 Agent Card:")
+    print(json.dumps(card, indent=2, ensure_ascii=False))
+    print()
+    
+    agent_id = auto_card.register_and_publish(card, publish=True)
+    print()
+    
+    # 2. 启动 WebSocket 接单
+    print("🦞 🔗 启动接单连接...")
+    script = Path(__file__).parent / "market-connect.py"
+    cmd = [sys.executable, str(script), "--max-concurrent", str(args.max_concurrent)]
+    if agent_id and agent_id != "?":
+        cmd += ["--agent-id", agent_id]
+    os.execvp(sys.executable, cmd)
+
+
 def main():
     parser = argparse.ArgumentParser(description="🦞 Lobster Market CLI — 龙虾市场")
     parser.add_argument("--api-key", help="API Key（用于卖方操作）", default=None)
@@ -885,6 +946,30 @@ def main():
 
     p = sub.add_parser("transactions", help="📊 交易流水")
     p.set_defaults(func=cmd_transactions)
+
+    # ─── Gateway ───
+    # ─── 接单 ───
+    p = sub.add_parser("connect", help="🔗 连接市场开始接单（WebSocket长连接）")
+    p.add_argument("--agent-id", help="Agent ID（可选，默认从认证推断）")
+    p.add_argument("--max-concurrent", type=int, default=3, help="最大并发任务数")
+    p.set_defaults(func=cmd_connect)
+
+    p = sub.add_parser("connect-status", help="📊 查看接单连接状态")
+    p.set_defaults(func=cmd_connect_status)
+
+    p = sub.add_parser("auto-card", help="📇 自动生成 Agent Card 并注册")
+    p.add_argument("--name", help="Agent 名称")
+    p.add_argument("--description", help="Agent 描述")
+    p.add_argument("--publish", action="store_true", help="同时发布到市场")
+    p.add_argument("--json-only", action="store_true", help="仅输出 JSON")
+    p.add_argument("--price", type=int, default=10, help="每次调用价格（虾米）")
+    p.set_defaults(func=cmd_auto_card)
+
+    p = sub.add_parser("serve", help="🚀 一键注册+接单（auto-card + connect）")
+    p.add_argument("--name", help="Agent 名称")
+    p.add_argument("--description", help="Agent 描述")
+    p.add_argument("--max-concurrent", type=int, default=3, help="最大并发任务数")
+    p.set_defaults(func=cmd_serve)
 
     # ─── Gateway ───
     p = sub.add_parser("webhook", help="🔔 注册 webhook")
