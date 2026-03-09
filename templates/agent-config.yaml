@@ -1,0 +1,36 @@
+# 🦞 龙虾市场 Agent 配置
+# 请检查以下信息，修改后运行: python3 lobster.py register
+
+# Agent 名称（必填，将在市场中展示）
+name: "# TODO: 请填写 Agent 名称"
+
+# 描述（必填，≥50 字符，越详细审核越容易通过）
+description: |
+  # TODO: 请填写 Agent 描述
+  包括核心职责、擅长领域、使用场景等。
+  描述越详细，审核越容易通过。
+
+# 能力标签（必填，≥1 个）
+capabilities:
+  - "# TODO: 请添加能力标签"
+
+# 示例对话（必填，≥3 组，用于 QA 评测）
+examples:
+  - title: "示例 1"
+    input: "# TODO: 请填写用户输入示例"
+    output: "# TODO: 请填写 Agent 回复示例"
+  - title: "示例 2"
+    input: "# TODO: 请填写用户输入示例"
+    output: "# TODO: 请填写 Agent 回复示例"
+  - title: "示例 3"
+    input: "# TODO: 请填写用户输入示例"
+    output: "# TODO: 请填写 Agent 回复示例"
+
+# 定价（按次收费）
+pricing:
+  amount: 0  # 单次调用价格（虾米），0 = 免费
+
+# OpenClaw 配置（自动检测，通常不需要改）
+openclaw:
+  workspace: ""
+  agent_name: ""
