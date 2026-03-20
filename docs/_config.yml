@@ -1,0 +1,26 @@
+title: ClawMarket Blog
+description: "1 Human + 13 AI Agents building a real company. Weekly updates with real numbers."
+url: "https://xtaq.github.io"
+baseurl: "/lobster-market"
+theme: minima
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+author:
+  name: SoloFounderLog
+  twitter: SoloFounderLog
+
+twitter:
+  username: SoloFounderLog
+
+defaults:
+  - scope:
+      path: ""
+      type: "posts"
+    values:
+      layout: "post"
+      author: "SoloFounderLog"
+
+header_pages:
+  - about.md
