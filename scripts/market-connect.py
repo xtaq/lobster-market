@@ -56,6 +56,7 @@ PROTOCOL_VERSION = 1
 HEARTBEAT_INTERVAL = 25
 RECONNECT_DELAY = 5
 MAX_RECONNECT_DELAY = 60
+_TOKEN_REFRESH_BUFFER = 120  # refresh when ≤120s before expiry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,6 +71,21 @@ log = logging.getLogger("market-connect")
 # ---------------------------------------------------------------------------
 
 
+def _decode_jwt_exp(token: str):
+    """Decode JWT payload to extract exp claim (no signature verification)."""
+    import base64
+
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return payload.get("exp")
+    except Exception:
+        return None
+
+
 def load_token() -> str:
     if not TOKEN_FILE.exists():
         log.error("No token file at %s. Run: lobster.py login-by-key <key>", TOKEN_FILE)
@@ -78,10 +94,58 @@ def load_token() -> str:
     return data.get("access_token", "")
 
 
+def _login_by_key(api_key: str, api_secret: str) -> str:
+    """Login via API key and persist the new token. Returns access_token or ''."""
+    import http.client
+
+    try:
+        conn = http.client.HTTPSConnection(BASE_HOST, timeout=30)
+        body = json.dumps({"api_key": api_key, "api_secret": api_secret})
+        conn.request(
+            "POST",
+            "/api/v1/auth/login-by-key",
+            body,
+            {"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        raw = resp.read().decode()
+        conn.close()
+        if resp.status == 200:
+            result = json.loads(raw)
+            token = result.get("access_token", "")
+            if token:
+                TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+                # Preserve api_key/api_secret in token.json for future re-login
+                result["api_key"] = api_key
+                result["api_secret"] = api_secret
+                TOKEN_FILE.write_text(json.dumps(result, indent=2))
+                TOKEN_FILE.chmod(0o600)
+                return token
+        else:
+            log.warning("API key login failed: HTTP %d", resp.status)
+    except Exception as e:
+        log.warning("API key login request failed: %s", e)
+    return ""
+
+
 def refresh_token() -> str:
     import http.client
 
-    # Method 1: refresh_token from token.json
+    # Method 1 (preferred): Re-login via saved API key — avoids refresh_token reuse/revocation
+    if TOKEN_FILE.exists():
+        try:
+            tk_data = json.loads(TOKEN_FILE.read_text())
+            ak = tk_data.get("api_key", "")
+            sk = tk_data.get("api_secret", "")
+            if ak and sk:
+                token = _login_by_key(ak, sk)
+                if token:
+                    log.info("✅ Token refreshed via saved API key (re-login)")
+                    return token
+        except Exception as e:
+            log.warning("Saved API key re-login failed: %s", e)
+
+    # Method 2 (fallback): refresh_token — may fail if token was already reused
     if TOKEN_FILE.exists():
         try:
             tk_data = json.loads(TOKEN_FILE.read_text())
@@ -91,7 +155,7 @@ def refresh_token() -> str:
                 body = json.dumps({"refresh_token": rt})
                 conn.request(
                     "POST",
-                    "/api/v1/users/refresh",
+                    "/api/v1/auth/refresh",
                     body,
                     {"Content-Type": "application/json"},
                 )
@@ -102,40 +166,30 @@ def refresh_token() -> str:
                     result = json.loads(raw)
                     token = result.get("access_token", "")
                     if token:
+                        # Preserve existing api_key/api_secret
+                        for key in ("api_key", "api_secret"):
+                            if key in tk_data and key not in result:
+                                result[key] = tk_data[key]
                         TOKEN_FILE.write_text(json.dumps(result, indent=2))
+                        TOKEN_FILE.chmod(0o600)
                         log.info("✅ Token refreshed via refresh_token")
                         return token
+                elif resp.status == 401:
+                    log.warning("⚠️  refresh_token 被拒绝（可能已被使用过），跳过")
         except Exception as e:
             log.warning("refresh_token method failed: %s", e)
 
-    # Method 2: master key login
+    # Method 3 (last resort): master key file
     if MASTER_KEY_FILE.exists():
         try:
             mk_data = json.loads(MASTER_KEY_FILE.read_text())
             master_key = mk_data.get("master_key", "")
             master_secret = mk_data.get("master_secret", "")
             if master_key and master_secret:
-                conn = http.client.HTTPSConnection(BASE_HOST, timeout=30)
-                body = json.dumps({"api_key": master_key, "api_secret": master_secret})
-                conn.request(
-                    "POST",
-                    "/api/v1/auth/login-by-key",
-                    body,
-                    {"Content-Type": "application/json"},
-                )
-                resp = conn.getresponse()
-                raw = resp.read().decode()
-                conn.close()
-                if resp.status == 200:
-                    result = json.loads(raw)
-                    token = result.get("access_token", "")
-                    if token:
-                        TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-                        TOKEN_FILE.write_text(json.dumps(result, indent=2))
-                        log.info("✅ Token refreshed via master key")
-                        return token
-                else:
-                    log.warning("Master key login failed: %d", resp.status)
+                token = _login_by_key(master_key, master_secret)
+                if token:
+                    log.info("✅ Token refreshed via master key (re-login)")
+                    return token
         except Exception as e:
             log.warning("master_key method failed: %s", e)
 
@@ -341,6 +395,19 @@ async def connect_loop(agent_id: str, local_endpoint: str, max_concurrent: int):
                 delay = min(delay * 2, MAX_RECONNECT_DELAY)
                 continue
 
+        # Pre-check: if token is expired or about to expire, refresh before connecting
+        exp = _decode_jwt_exp(token)
+        if exp is not None and exp - time.time() <= 120:
+            log.info("⏳ Token 即将过期，先刷新再连接...")
+            new_token = refresh_token()
+            if new_token:
+                token = new_token
+            elif exp - time.time() <= 0:
+                log.error("Token 已过期且刷新失败，retrying in %ds", delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, MAX_RECONNECT_DELAY)
+                continue
+
         try:
             log.info("🔌 Connecting to %s ...", ws_url)
             async with websockets.connect(
@@ -366,7 +433,11 @@ async def connect_loop(agent_id: str, local_endpoint: str, max_concurrent: int):
                     reason = resp.get("reason", "unknown")
                     log.error("❌ Auth failed: %s", reason)
                     if "token" in reason.lower():
-                        refresh_token()
+                        new_tk = refresh_token()
+                        if new_tk:
+                            log.info("🔄 Token 刷新成功，立即重连...")
+                            delay = RECONNECT_DELAY
+                            continue  # retry immediately with new token
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, MAX_RECONNECT_DELAY)
                     continue

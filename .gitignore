@@ -1,0 +1,7 @@
+# Generated config with local paths — do not commit
+agent-config.yaml
+
+# Python
+__pycache__/
+*.pyc
+.ruff_cache/

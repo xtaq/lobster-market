@@ -11,18 +11,27 @@
 """
 
 import argparse
+import base64
 import getpass
 import json
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
+import urllib.request
+
+# T-591: Bypass system proxy for urllib (prevents 127.0.0.1:7890 interception)
+urllib.request.install_opener(
+    urllib.request.build_opener(urllib.request.ProxyHandler({}))
+)
 
 try:
     import yaml
@@ -67,12 +76,13 @@ def _http_request(
     body: Optional[dict] = None,
     token: Optional[str] = None,
     host: Optional[str] = None,
+    timeout: int = 30,
 ) -> Tuple[int, dict]:
     """Simple HTTP(S) request using stdlib only."""
     import http.client
 
     h = host or _get_host()
-    conn = http.client.HTTPSConnection(h, timeout=30)
+    conn = http.client.HTTPSConnection(h, timeout=timeout)
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -101,12 +111,101 @@ def _load_token() -> Optional[dict]:
         return None
 
 
+def _decode_jwt_exp(token: str) -> Optional[float]:
+    """Decode JWT payload to extract exp claim (no signature verification)."""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        # Add padding for base64url
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return payload.get("exp")
+    except Exception:
+        return None
+
+
+def _refresh_access_token(token_data: dict) -> Optional[str]:
+    """Call refresh endpoint to get a new access token. Returns new token or None."""
+    refresh_token = token_data.get("refresh_token")
+    if not refresh_token:
+        return None
+
+    host = token_data.get("host") or _get_host()
+    try:
+        status, result = _http_request(
+            "POST",
+            "/api/v1/auth/refresh",
+            body={"refresh_token": refresh_token},
+            host=host,
+            timeout=10,
+        )
+    except Exception as e:
+        log.warning("Token refresh request failed: %s", e)
+        return None
+
+    if status != 200:
+        detail = ""
+        if isinstance(result, dict):
+            detail = result.get("detail", result.get("message", ""))
+        log.warning("Token refresh failed (HTTP %s): %s", status, detail)
+        return None
+
+    new_access = result.get("access_token", "")
+    new_refresh = result.get("refresh_token", "")
+    if not new_access:
+        return None
+
+    # Persist refreshed tokens
+    token_data["access_token"] = new_access
+    if new_refresh:
+        token_data["refresh_token"] = new_refresh
+    token_data["refreshed_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        _ensure_dir()
+        TOKEN_FILE.write_text(json.dumps(token_data, indent=2))
+        TOKEN_FILE.chmod(0o600)
+    except Exception as e:
+        log.warning("Failed to persist refreshed token: %s", e)
+
+    log.info("🔄 Token 自动刷新成功")
+    return new_access
+
+
+_TOKEN_REFRESH_BUFFER_SECONDS = 120  # refresh when ≤120s before expiry
+
+
 def _require_token() -> str:
     data = _load_token()
     if not data or not data.get("access_token"):
         print("❌ 未登录。请先运行: python3 lobster.py login")
+        print("   还没有 API Key？前往: https://mindcore8.com/dashboard/api-keys")
         sys.exit(1)
-    return data["access_token"]
+
+    access_token = data["access_token"]
+
+    # Check if token is expired or about to expire, then auto-refresh
+    exp = _decode_jwt_exp(access_token)
+    if exp is not None:
+        remaining = exp - time.time()
+        if remaining <= _TOKEN_REFRESH_BUFFER_SECONDS:
+            log.info(
+                "⏳ Token %s，尝试自动刷新...",
+                "已过期" if remaining <= 0 else f"将在 {int(remaining)}s 后过期",
+            )
+            new_token = _refresh_access_token(data)
+            if new_token:
+                return new_token
+            # Refresh failed — if token is truly expired, bail out
+            if remaining <= 0:
+                print(
+                    "❌ Token 已过期且自动刷新失败。请重新登录: python3 lobster.py login"
+                )
+                sys.exit(1)
+            # Token not yet expired, use existing one with warning
+            log.warning("⚠️ Token 即将过期且刷新失败，使用当前 token 继续...")
+
+    return access_token
 
 
 def _load_agent() -> Optional[dict]:
@@ -142,10 +241,14 @@ def cmd_login(args):
         print("🦞 龙虾市场登录")
         print(f"   平台: {host}")
         print()
+        print("   还没有 API Key？前往创建：")
+        print("   👉 https://mindcore8.com/dashboard/api-keys")
+        print()
         api_key_str = getpass.getpass("请输入 API Key (格式 key:secret): ")
 
     if ":" not in api_key_str:
         print("❌ API Key 格式错误，正确格式: key:secret")
+        print("   前往创建 Master Key: https://mindcore8.com/dashboard/api-keys")
         sys.exit(1)
 
     api_key, api_secret = api_key_str.split(":", 1)
@@ -169,6 +272,8 @@ def cmd_login(args):
     token_data = {
         "access_token": result.get("access_token", ""),
         "refresh_token": result.get("refresh_token", ""),
+        "api_key": api_key,
+        "api_secret": api_secret,
         "host": host,
         "logged_in_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -430,10 +535,93 @@ def _write_config_yaml(path: Path, config: dict):
 # ---------------------------------------------------------------------------
 
 
+def _read_workspace_files(args, config: dict) -> dict:
+    """Read workspace files (SOUL.md, AGENTS.md, etc.) for Fly deployment.
+
+    Resolution order for workspace directory:
+    1. --workspace CLI argument
+    2. openclaw.workspace from agent-config.yaml
+    3. (skip silently — backwards compatible with non-Fly flow)
+
+    Returns dict like {"soul_md": "...", "agents_md": "...", ...} or empty dict.
+    """
+    workspace_path_str = getattr(args, "workspace", None)
+    if not workspace_path_str:
+        workspace_path_str = config.get("openclaw", {}).get("workspace", "")
+
+    if not workspace_path_str:
+        return {}
+
+    workspace_dir = Path(workspace_path_str).expanduser().resolve()
+    if not workspace_dir.is_dir():
+        log.warning("Workspace 目录不存在: %s，跳过 workspace_files", workspace_dir)
+        return {}
+
+    # Map: filename → API key
+    file_map = {
+        "SOUL.md": "soul_md",
+        "AGENTS.md": "agents_md",
+        "IDENTITY.md": "identity_md",
+        "MEMORY.md": "memory_md",
+    }
+
+    workspace_files = {}
+    for fname, key in file_map.items():
+        fpath = workspace_dir / fname
+        if fpath.exists():
+            try:
+                content = fpath.read_text(encoding="utf-8")
+                if content.strip():
+                    workspace_files[key] = content
+            except Exception as e:
+                log.warning("读取 %s 失败: %s", fpath, e)
+
+    # Skills: read skills/*/SKILL.md, assemble as skills_manifest JSON
+    skills_dir = workspace_dir / "skills"
+    if skills_dir.exists() and skills_dir.is_dir():
+        skills_manifest = []
+        for skill_dir in sorted(skills_dir.iterdir()):
+            if not skill_dir.is_dir():
+                continue
+            skill_md = skill_dir / "SKILL.md"
+            if skill_md.exists():
+                try:
+                    content = skill_md.read_text(encoding="utf-8")
+                    skills_manifest.append(
+                        {
+                            "slug": skill_dir.name,
+                            "content": content[:4096],  # truncate per spec
+                        }
+                    )
+                except Exception as e:
+                    log.warning("读取 %s 失败: %s", skill_md, e)
+        if skills_manifest:
+            workspace_files["skills_manifest"] = json.dumps(
+                skills_manifest, ensure_ascii=False
+            )
+
+    if not workspace_files:
+        log.warning("Workspace 目录为空或无可读文件: %s", workspace_dir)
+
+    return workspace_files
+
+
 def cmd_register(args):
-    """读取配置文件，注册 Agent 到龙虾市场。"""
+    """读取配置文件，注册/更新 Agent 到龙虾市场。
+
+    Supports --agent-id to force-update an existing agent (PUT).
+    Without --agent-id, auto-reads from ~/.lobster-market/agent.json for idempotent updates.
+    """
     token = _require_token()
     config_path = Path(args.config or DEFAULT_CONFIG)
+
+    # Determine agent_id for update mode
+    update_agent_id = getattr(args, "agent_id", None)
+    if not update_agent_id:
+        # Auto-read from saved agent.json
+        saved = _load_agent()
+        if saved and saved.get("agent_id"):
+            update_agent_id = saved["agent_id"]
 
     if not config_path.exists():
         print(f"❌ 配置文件不存在: {config_path}")
@@ -494,8 +682,11 @@ def cmd_register(args):
     pricing_amount = config.get("pricing", {}).get("amount", 0)
 
     if not args.yes:
+        action_word = "更新" if update_agent_id else "注册"
         print()
-        print("🦞 即将注册以下 Agent:")
+        print(f"🦞 即将{action_word}以下 Agent:")
+        if update_agent_id:
+            print(f"  Agent ID: {update_agent_id}")
         print()
         print(f"  名称:     {name}")
         print(f"  描述:     {desc_preview}...")
@@ -507,7 +698,7 @@ def cmd_register(args):
             else "  定价:     免费"
         )
         print()
-        confirm = input("确认注册? [Y/n] ").strip().lower()
+        confirm = input(f"确认{action_word}? [Y/n] ").strip().lower()
         if confirm and confirm != "y":
             print("已取消")
             return
@@ -529,20 +720,65 @@ def cmd_register(args):
         "endpoint_url": "https://broker-managed",
     }
 
-    print("📤 正在注册...")
-    status_code, result = _http_request(
-        "POST",
-        "/api/v1/agents/register",
-        body=body,
-        token=token,
-    )
+    # workspace_files: read from workspace directory for Fly deployment
+    workspace_files = _read_workspace_files(args, config)
+    if workspace_files:
+        body["workspace_files"] = workspace_files
+        print(f"  📂 Workspace 文件: {', '.join(workspace_files.keys())}")
+
+    # card_skills: read from config and include in body
+    card_skills = config.get("card_skills", [])
+    if card_skills:
+        body["card_skills"] = [
+            s.get("slug") or s if isinstance(s, dict) else s for s in card_skills
+        ]
+
+    # Avatar: generate from emoji if avatar_url is not set
+    avatar_emoji = config.get("avatar_emoji", "")
+    avatar_url = config.get("avatar_url", "")
+    if avatar_emoji and not avatar_url:
+        avatar_url = _generate_avatar_data_url(avatar_emoji)
+        print(f"  🎨 自动生成 emoji 头像: {avatar_emoji}")
+    if avatar_url:
+        body["avatar_url"] = avatar_url
+    if avatar_emoji:
+        body["avatar_emoji"] = avatar_emoji
+
+    # Decide: POST (new) or PUT (update existing)
+    if update_agent_id:
+        print(f"📤 正在更新 Agent ({update_agent_id[:8]}...)...")
+        status_code, result = _http_request(
+            "PUT",
+            f"/api/v1/agents/{update_agent_id}",
+            body=body,
+            token=token,
+        )
+        # Fallback: if PUT returns 404/405, try POST
+        if status_code in (404, 405):
+            print("  ⚠️  PUT 不支持，回退到 POST 创建...")
+            update_agent_id = None
+            status_code, result = _http_request(
+                "POST",
+                "/api/v1/agents/register",
+                body=body,
+                token=token,
+            )
+    else:
+        print("📤 正在注册...")
+        status_code, result = _http_request(
+            "POST",
+            "/api/v1/agents/register",
+            body=body,
+            token=token,
+        )
 
     if status_code not in (200, 201):
         error = result.get("detail", result.get("message", f"HTTP {status_code}"))
-        print(f"❌ 注册失败: {error}")
+        action_word = "更新" if update_agent_id else "注册"
+        print(f"❌ {action_word}失败: {error}")
         sys.exit(1)
 
-    agent_id = result.get("agent_id", result.get("id", ""))
+    agent_id = update_agent_id or result.get("agent_id", result.get("id", ""))
     review_status = result.get("status", "pending_review")
 
     # Save agent info
@@ -555,14 +791,38 @@ def cmd_register(args):
     }
     AGENT_FILE.write_text(json.dumps(agent_data, indent=2))
 
+    is_update = bool(update_agent_id)
     print()
-    print("✅ 注册成功!")
+    print(f"✅ {'更新' if is_update else '注册'}成功!")
     print()
     print(f"  Agent ID:  {agent_id}")
-    print(f"  状态:      {review_status}（审核中）")
+    print(f"  状态:      {review_status}{'（已更新）' if is_update else '（审核中）'}")
+    if avatar_emoji:
+        print(
+            f"  头像:      {avatar_emoji}{'（自动生成 SVG）' if not config.get('avatar_url') else ''}"
+        )
     print()
-    print("审核通常 30 分钟内完成，运行查看进度:")
-    print("  python3 lobster.py status")
+    # Auto-connect after registration (unless --no-connect)
+    no_connect = getattr(args, "no_connect", False)
+    if not no_connect:
+        print("🔌 注册成功，自动连接市场（QA 评测需要 Agent 在线）...")
+        print("   使用 --no-connect 可跳过自动连接")
+        print()
+        # Build a minimal args namespace for cmd_connect
+        connect_args = argparse.Namespace(
+            agent_id=agent_id,
+            port=getattr(args, "port", None),
+            daemon=getattr(args, "daemon", False),
+            stop=False,
+        )
+        cmd_connect(connect_args)
+    else:
+        if not is_update:
+            print("⚠️  注意: QA 评测需要 Agent 在线，请尽快运行:")
+            print("  python3 lobster.py connect")
+            print()
+            print("审核通常 30 分钟内完成，运行查看进度:")
+            print("  python3 lobster.py status")
 
 
 # ---------------------------------------------------------------------------
@@ -570,8 +830,33 @@ def cmd_register(args):
 # ---------------------------------------------------------------------------
 
 
+def _stop_daemon():
+    """Stop running daemon processes via PID files."""
+    stopped = False
+    for name in ("watchdog", "adapter", "connect"):
+        pidfile = PIDS_DIR / f"{name}.pid"
+        if pidfile.exists():
+            try:
+                pid = int(pidfile.read_text().strip())
+                os.kill(pid, signal.SIGTERM)
+                print(f"  ▸ 已停止 {name} (PID {pid})")
+                stopped = True
+            except (ProcessLookupError, ValueError):
+                pass
+            pidfile.unlink(missing_ok=True)
+    if stopped:
+        print("✅ 后台进程已停止")
+    else:
+        print("ℹ️  没有正在运行的后台进程")
+
+
 def cmd_connect(args):
     """启动 adapter + connector，连接龙虾市场。"""
+    # Handle --stop
+    if getattr(args, "stop", False):
+        _stop_daemon()
+        return
+
     token = _require_token()
     agent_id = _require_agent_id(args.agent_id)
     port = args.port or DEFAULT_ADAPTER_PORT
@@ -612,11 +897,16 @@ def cmd_connect(args):
     )
 
     # 2. Wait for adapter to be ready
-    import urllib.request
 
+    health_timeout = getattr(args, "health_timeout", None) or 30
     health_url = f"http://localhost:{port}/health"
     ready = False
-    for i in range(20):
+    max_attempts = int(health_timeout / 0.5)
+    for i in range(max_attempts):
+        # If the adapter process died, stop waiting immediately
+        if adapter_proc.poll() is not None:
+            print(f"❌ Adapter 进程已退出 (exit code: {adapter_proc.returncode})")
+            sys.exit(1)
         time.sleep(0.5)
         try:
             with urllib.request.urlopen(health_url, timeout=2) as resp:
@@ -627,7 +917,8 @@ def cmd_connect(args):
             pass
 
     if not ready:
-        print("❌ Adapter 启动超时")
+        print(f"❌ Adapter 启动超时（等待 {health_timeout}s）")
+        print("   可通过 --health-timeout 调大等待时间")
         adapter_proc.terminate()
         sys.exit(1)
 
@@ -662,19 +953,29 @@ def cmd_connect(args):
     print("  📡 等待任务中... (Ctrl+C 退出)")
     print()
 
-    # Daemon mode
+    # Daemon mode with watchdog
     if args.daemon:
         PIDS_DIR.mkdir(parents=True, exist_ok=True)
-        (PIDS_DIR / "adapter.pid").write_text(str(adapter_proc.pid))
-        (PIDS_DIR / "connect.pid").write_text(str(connect_proc.pid))
+        log_dir = PIDS_DIR
+        _save_daemon_pids(adapter_proc, connect_proc)
+
         print(f"  后台运行中，PID 文件: {PIDS_DIR}/")
-        print(
-            "  停止: kill $(cat ~/.lobster-market/pids/adapter.pid) $(cat ~/.lobster-market/pids/connect.pid)"
+        print("  停止: python3 lobster.py connect --stop")
+
+        # Watchdog: monitor child processes, restart if crashed
+        _run_watchdog(
+            adapter_cmd=adapter_cmd,
+            connect_cmd=connect_cmd,
+            adapter_proc=adapter_proc,
+            connect_proc=connect_proc,
+            health_url=f"http://localhost:{port}/health",
+            log_dir=log_dir,
         )
         return
 
     # Foreground mode: stream logs, handle Ctrl+C
     def _shutdown(signum, frame):
+        """信号处理：优雅关闭 adapter 和 connector 子进程。"""
         print("\n👋 正在关闭...")
         connect_proc.terminate()
         adapter_proc.terminate()
@@ -717,6 +1018,115 @@ def cmd_connect(args):
         sel.close()
         adapter_proc.terminate()
         connect_proc.terminate()
+
+
+def _save_daemon_pids(adapter_proc, connect_proc):
+    """Save daemon PID files."""
+    PIDS_DIR.mkdir(parents=True, exist_ok=True)
+    (PIDS_DIR / "adapter.pid").write_text(str(adapter_proc.pid))
+    (PIDS_DIR / "connect.pid").write_text(str(connect_proc.pid))
+    # Save watchdog (parent) PID
+    (PIDS_DIR / "watchdog.pid").write_text(str(os.getpid()))
+
+
+def _run_watchdog(
+    adapter_cmd,
+    connect_cmd,
+    adapter_proc,
+    connect_proc,
+    health_url,
+    log_dir,
+    check_interval=10,
+    max_restarts=50,
+):
+    """Watchdog loop: monitor adapter + connector, restart on crash.
+
+    Runs as the daemon foreground process (detached from terminal).
+    Exits after max_restarts consecutive failures or on SIGTERM.
+    """
+    restart_counts = {"adapter": 0, "connector": 0}
+    running = True
+
+    def _stop(signum, frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    log.info(
+        "🐕 Watchdog 启动，监控间隔 %ds，最大重启 %d 次", check_interval, max_restarts
+    )
+
+    while running:
+        time.sleep(check_interval)
+
+        # Check adapter
+        if adapter_proc.poll() is not None:
+            rc = adapter_proc.returncode
+            restart_counts["adapter"] += 1
+            if restart_counts["adapter"] > max_restarts:
+                log.error("❌ Adapter 连续重启超过 %d 次，放弃", max_restarts)
+                break
+            log.warning(
+                "⚠️  Adapter 退出 (code=%s)，第 %d 次重启...",
+                rc,
+                restart_counts["adapter"],
+            )
+            adapter_log = log_dir / "adapter-restart.log"
+            with open(adapter_log, "a") as lf:
+                adapter_proc = subprocess.Popen(
+                    adapter_cmd, stdout=lf, stderr=subprocess.STDOUT
+                )
+            _save_daemon_pids(adapter_proc, connect_proc)
+            # Wait for adapter health
+            time.sleep(2)
+            try:
+                with urllib.request.urlopen(health_url, timeout=3) as resp:
+                    if resp.status == 200:
+                        log.info("✅ Adapter 重启成功 (PID %d)", adapter_proc.pid)
+                        restart_counts["adapter"] = 0  # reset on success
+            except Exception:
+                log.warning("⚠️  Adapter 重启后健康检查失败")
+        else:
+            restart_counts["adapter"] = 0
+
+        # Check connector
+        if connect_proc.poll() is not None:
+            rc = connect_proc.returncode
+            restart_counts["connector"] += 1
+            if restart_counts["connector"] > max_restarts:
+                log.error("❌ Connector 连续重启超过 %d 次，放弃", max_restarts)
+                break
+            log.warning(
+                "⚠️  Connector 退出 (code=%s)，第 %d 次重启...",
+                rc,
+                restart_counts["connector"],
+            )
+            connect_log = log_dir / "connect-restart.log"
+            with open(connect_log, "a") as lf:
+                connect_proc = subprocess.Popen(
+                    connect_cmd, stdout=lf, stderr=subprocess.STDOUT
+                )
+            _save_daemon_pids(adapter_proc, connect_proc)
+            log.info("✅ Connector 重启成功 (PID %d)", connect_proc.pid)
+            restart_counts["connector"] = 0
+        else:
+            restart_counts["connector"] = 0
+
+    # Cleanup
+    log.info("🐕 Watchdog 退出，清理子进程...")
+    for proc in (adapter_proc, connect_proc):
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+    # Clean PID files
+    for f in ("adapter.pid", "connect.pid", "watchdog.pid"):
+        (PIDS_DIR / f).unlink(missing_ok=True)
+    log.info("✅ Watchdog 已退出")
 
 
 # ---------------------------------------------------------------------------
@@ -764,6 +1174,15 @@ def cmd_status(args):
     print(f"🦞 Agent 状态: {name}")
     print("───────────────────────────────")
 
+    # Fly Machine status
+    fly_machine_id = agent_info.get("fly_machine_id", "")
+    fly_machine_status = agent_info.get("fly_machine_status", "")
+    fly_region = agent_info.get("fly_region", "")
+    if fly_machine_id:
+        region_str = f" [{fly_region}]" if fly_region else ""
+        status_str = fly_machine_status or "unknown"
+        print(f"  Fly Machine: {fly_machine_id} ({status_str}){region_str}")
+
     # Connection status
     connected = health_info.get("connected", health_info.get("online", False))
     if connected:
@@ -771,16 +1190,27 @@ def cmd_status(args):
     else:
         print("  连接:    ⚪ 未连接")
 
-    # Review status
+    # Review status — response structure from agent-service/qa_evaluation.py:
+    #   passed:  {"status": "passed", "result": {"score", "grade", "details", ...}}
+    #   failed:  {"status": "failed", "result": {"score", "failure_reasons", "improvement_suggestions"}}
+    #   evaluating: {"status": "evaluating", "progress": {"current_step", "steps": [...]}, "estimated_remaining_minutes"}
+    #   pending: {"status": "pending", "progress": {...}, "estimated_remaining_minutes"}
     review_status = review_info.get("status", agent_info.get("status", "unknown"))
+    result = review_info.get("result", {})
+
     if review_status in ("approved", "active", "passed"):
-        score = review_info.get("score", review_info.get("rating", {}).get("score"))
-        grade = review_info.get("grade", review_info.get("rating", {}).get("grade", ""))
+        score = result.get("score")
+        grade = result.get("grade", "")
         print("  审核:    ✅ 已通过")
         if grade and score:
             print(f"  评级:    {grade} ({score}/5.0)")
         elif score:
             print(f"  评级:    {score}/5.0")
+
+        # Auto tags / trust labels from QA
+        auto_tags = result.get("auto_tags", [])
+        if auto_tags:
+            print(f"  自动标签: {', '.join(auto_tags)}")
 
         # Stats
         calls = agent_info.get(
@@ -795,32 +1225,45 @@ def cmd_status(args):
             print(f"  平均评分: {avg_rating}/5.0")
 
     elif review_status in ("pending_review", "pending", "evaluating", "in_review"):
-        step = review_info.get("current_step", "")
-        total_steps = review_info.get("total_steps", 4)
-        current_step = review_info.get("step_number", "")
-        eta = review_info.get("eta_minutes", "")
+        progress = review_info.get("progress", {})
+        current_step = progress.get("current_step", "")
+        steps = progress.get("steps", [])
+        eta = review_info.get("estimated_remaining_minutes", "")
 
         status_text = "🔄 审核中"
-        if step and current_step:
-            status_text += f"（步骤 {current_step}/{total_steps}: {step}）"
+        if current_step:
+            # Count completed steps
+            done = sum(1 for s in steps if s.get("status") == "completed")
+            total = len(steps) or 4
+            status_text += f"（{done}/{total}: {current_step}）"
         print(f"  审核:    {status_text}")
         if eta:
             print(f"  预计:    约 {eta} 分钟后完成")
 
+        # Show step details
+        if steps:
+            for s in steps:
+                icon = (
+                    "✅"
+                    if s.get("status") == "completed"
+                    else "⏳"
+                    if s.get("status") == "in_progress"
+                    else "⬜"
+                )
+                print(f"    {icon} {s.get('name', '?')}")
+
     elif review_status in ("rejected", "failed"):
-        score = review_info.get("score", "")
+        score = result.get("score", "")
         print("  审核:    ❌ 未通过" + (f" ({score}/5.0)" if score else ""))
 
-        reasons = review_info.get("reasons", review_info.get("failure_reasons", []))
+        reasons = result.get("failure_reasons", [])
         if reasons:
             print("───────────────────────────────")
             print("  失败原因:")
             for r in reasons:
                 print(f"    - {r}")
 
-        suggestions = review_info.get(
-            "suggestions", review_info.get("improvement_suggestions", [])
-        )
+        suggestions = result.get("improvement_suggestions", [])
         if suggestions:
             print("  改进建议:")
             for s in suggestions:
@@ -830,6 +1273,10 @@ def cmd_status(args):
         print("  修改 agent-config.yaml 后重新运行: python3 lobster.py register")
     else:
         print(f"  审核:    {review_status}")
+        if review_status == "not_evaluated":
+            msg = review_info.get("message", "")
+            if msg:
+                print(f"  说明:    {msg}")
 
     print("───────────────────────────────")
 
@@ -855,199 +1302,223 @@ def cmd_status(args):
 
 
 # ---------------------------------------------------------------------------
+# push — Skills Bundle Upload (T-854)
+# ---------------------------------------------------------------------------
+
+SKILLS_EXCLUDE_PATTERNS = {
+    "__pycache__/",
+    "*.pyc",
+    ".DS_Store",
+    ".git/",
+    "node_modules/",
+    "venv/",
+    ".venv/",
+    ".ruff_cache/",
+    "*.egg-info/",
+}
+MAX_SINGLE_SKILL_BYTES = 1 * 1024 * 1024  # 1MB per skill (uncompressed)
+MAX_BUNDLE_BYTES = 5 * 1024 * 1024  # 5MB compressed bundle
+MAX_SKILL_COUNT = 50
+
+
+def _collect_skills(workspace: Path) -> dict:
+    """Collect user-defined skills from workspace/skills/.
+
+    Phase 1: Only user-defined skills (not OpenClaw public skills).
+    Returns dict of {skill_name: skill_dir_path}.
+    """
+    skills = {}
+    ws_skills = workspace / "skills"
+    if ws_skills.is_dir():
+        for skill_dir in sorted(ws_skills.iterdir()):
+            if skill_dir.is_dir() and (skill_dir / "SKILL.md").exists():
+                skills[skill_dir.name] = skill_dir
+
+    if skills:
+        log.info("📦 Found %d user skills", len(skills))
+
+    if len(skills) > MAX_SKILL_COUNT:
+        log.warning("⚠️  Skills count %d exceeds limit %d", len(skills), MAX_SKILL_COUNT)
+
+    return skills
+
+
+def _should_exclude(rel_path: str) -> bool:
+    """Check if a file should be excluded from the bundle."""
+    import fnmatch
+
+    for pattern in SKILLS_EXCLUDE_PATTERNS:
+        if pattern.endswith("/"):
+            if f"/{pattern}" in f"/{rel_path}/" or rel_path.startswith(pattern):
+                return True
+        elif "*" in pattern:
+            if fnmatch.fnmatch(rel_path.split("/")[-1], pattern):
+                return True
+        elif pattern in rel_path:
+            return True
+    return False
+
+
+def _create_skills_bundle(skills: dict) -> Path:
+    """Create a tar.gz bundle from collected skills.
+
+    Output structure inside tar:
+      skills/
+        my-skill/
+          SKILL.md
+          references/
+            ...
+    """
+    import tarfile
+    import tempfile
+
+    bundle_path = Path(tempfile.mktemp(suffix=".tar.gz", prefix="lobster-skills-"))
+
+    with tarfile.open(str(bundle_path), "w:gz") as tar:
+        for skill_name, skill_dir in sorted(skills.items()):
+            # Compute single skill size
+            skill_size = sum(
+                f.stat().st_size for f in skill_dir.rglob("*") if f.is_file()
+            )
+            if skill_size > MAX_SINGLE_SKILL_BYTES:
+                log.warning(
+                    "⚠️  Skill '%s' too large (%d KB), skipping",
+                    skill_name,
+                    skill_size // 1024,
+                )
+                continue
+
+            for file_path in sorted(skill_dir.rglob("*")):
+                if not file_path.is_file():
+                    continue
+                rel = file_path.relative_to(skill_dir.parent)
+                if _should_exclude(str(rel)):
+                    continue
+                tar.add(str(file_path), arcname=f"skills/{rel}")
+
+    # Check total size
+    bundle_size = bundle_path.stat().st_size
+    if bundle_size > MAX_BUNDLE_BYTES:
+        bundle_path.unlink()
+        print(
+            f"❌ Skills bundle too large: {bundle_size // 1024} KB (limit: {MAX_BUNDLE_BYTES // 1024} KB)"
+        )
+        sys.exit(1)
+
+    return bundle_path
+
+
+def _upload_skills_bundle(
+    token: str, agent_id: str, bundle_path: Path
+) -> Tuple[int, dict]:
+    """HTTP multipart upload skills tar.gz to the platform."""
+    import http.client
+
+    boundary = f"----LobsterSkillsBundle{uuid.uuid4().hex[:12]}"
+    host = _get_host()
+
+    with open(bundle_path, "rb") as f:
+        file_data = f.read()
+
+    body_parts = []
+    body_parts.append(f"--{boundary}\r\n".encode())
+    body_parts.append(
+        'Content-Disposition: form-data; name="bundle"; filename="skills.tar.gz"\r\n'.encode()
+    )
+    body_parts.append(b"Content-Type: application/gzip\r\n\r\n")
+    body_parts.append(file_data)
+    body_parts.append(f"\r\n--{boundary}--\r\n".encode())
+
+    body = b"".join(body_parts)
+
+    conn = http.client.HTTPSConnection(host, timeout=60)
+    headers = {
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Authorization": f"Bearer {token}",
+    }
+    conn.request("PUT", f"/api/v1/agents/{agent_id}/skills-bundle", body, headers)
+    resp = conn.getresponse()
+    raw = resp.read().decode()
+    conn.close()
+
+    try:
+        result = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        result = {"raw": raw}
+    return resp.status, result
+
+
+def cmd_push(args):
+    """打包 workspace skills 并上传到平台。"""
+    token = _require_token()
+    agent_id = _require_agent_id(getattr(args, "agent_id", None))
+
+    # Find workspace
+    workspace_hint = getattr(args, "workspace", None)
+    if not workspace_hint:
+        # Try reading from agent-config.yaml
+        config_path = Path(getattr(args, "config", None) or DEFAULT_CONFIG)
+        if config_path.exists():
+            try:
+                config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+                workspace_hint = config.get("openclaw", {}).get("workspace", "")
+            except Exception:
+                pass
+
+    workspace = _find_workspace(workspace_hint)
+    if not workspace:
+        print("❌ 未找到 OpenClaw workspace")
+        print("   请使用 --workspace 指定路径")
+        sys.exit(1)
+
+    # 1. Collect skills
+    print(f"🔍 扫描 skills: {workspace}")
+    skills = _collect_skills(workspace)
+
+    if not skills:
+        print("ℹ️  未找到任何 skills (需要 workspace/skills/*/SKILL.md)")
+        return
+
+    # 2. Create bundle
+    print(f"📦 打包 {len(skills)} 个 skills...")
+    bundle_path = _create_skills_bundle(skills)
+    bundle_size = bundle_path.stat().st_size
+
+    # 3. Show summary
+    print("\n📦 Skills Bundle:")
+    print(f"   大小: {bundle_size / 1024:.1f} KB (压缩后)")
+    print(f"   Skills: {len(skills)} 个")
+    for name in sorted(skills.keys()):
+        print(f"     📁 {name}")
+    print()
+
+    # 4. Confirm
+    yes = getattr(args, "yes", False)
+    if not yes:
+        confirm = input("确认上传? [Y/n] ").strip().lower()
+        if confirm and confirm != "y":
+            print("已取消")
+            bundle_path.unlink()
+            return
+
+    # 5. Upload
+    print("📤 上传中...")
+    status, result = _upload_skills_bundle(token, agent_id, bundle_path)
+    bundle_path.unlink(missing_ok=True)
+
+    if status in (200, 201):
+        version = result.get("version", "?")
+        skill_count = result.get("skill_count", len(skills))
+        print(f"✅ 上传成功! 版本: {version} ({skill_count} skills)")
+    else:
+        error = result.get("detail", result.get("message", f"HTTP {status}"))
+        print(f"❌ 上传失败: {error}")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # create — Agent Factory: LLM-powered workspace generation
 # ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# ClawHub Skill Integration
-# ---------------------------------------------------------------------------
-
-
-def _clawhub_available() -> bool:
-    """Check if clawhub CLI is available."""
-    try:
-        result = subprocess.run(
-            ["clawhub", "-V"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        return result.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
-
-
-def _search_skills(keywords: list, limit: int = 5) -> list:
-    """Search ClawHub for each keyword, deduplicate and rank results.
-
-    Returns list of dicts: [{slug, name, score, description}]
-    """
-    seen = {}  # slug -> best entry
-    for kw in keywords:
-        try:
-            result = subprocess.run(
-                ["clawhub", "search", kw, "--limit", str(limit)],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if result.returncode != 0:
-                continue
-            for line in result.stdout.strip().split("\n"):
-                line = line.strip()
-                if not line or line.startswith("-"):
-                    continue
-                # Format: "slug  Display Name  (score)"
-                m = re.match(r"^(\S+)\s+(.+?)\s+\(([0-9.]+)\)$", line)
-                if m:
-                    slug = m.group(1)
-                    name = m.group(2).strip()
-                    score = float(m.group(3))
-                    if slug not in seen or score > seen[slug]["score"]:
-                        seen[slug] = {
-                            "slug": slug,
-                            "name": name,
-                            "score": score,
-                            "keyword": kw,
-                        }
-        except (subprocess.TimeoutExpired, Exception) as e:
-            print(f"  ⚠️  搜索 '{kw}' 失败: {e}")
-
-    # Fetch descriptions via inspect for top results
-    ranked = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
-    for entry in ranked[:10]:
-        try:
-            result = subprocess.run(
-                ["clawhub", "inspect", entry["slug"]],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if result.returncode == 0:
-                for line in result.stdout.split("\n"):
-                    if line.startswith("Summary:"):
-                        entry["description"] = line[len("Summary:") :].strip()
-                        break
-        except Exception:
-            pass
-
-    return ranked
-
-
-def _check_skill_conflicts(skills: list) -> list:
-    """Basic compatibility check between skills.
-
-    Returns list of warning strings.
-    """
-    warnings = []
-    descs = {s["slug"]: s.get("description", "").lower() for s in skills}
-
-    # Check for overlapping functionality
-    slugs = list(descs.keys())
-    for i in range(len(slugs)):
-        for j in range(i + 1, len(slugs)):
-            a, b = slugs[i], slugs[j]
-            desc_a, desc_b = descs[a], descs[b]
-            # Simple keyword overlap check
-            words_a = set(desc_a.split())
-            words_b = set(desc_b.split())
-            # Filter short words
-            meaningful_a = {w for w in words_a if len(w) > 4}
-            meaningful_b = {w for w in words_b if len(w) > 4}
-            overlap = meaningful_a & meaningful_b
-            if len(overlap) >= 3:
-                warnings.append(
-                    f"⚠️  {a} 和 {b} 功能可能重叠（共同关键词: {', '.join(list(overlap)[:3])}）"
-                )
-
-    return warnings
-
-
-def _install_skills(skills: list, workspace_dir: str, interactive: bool = True) -> list:
-    """Install selected skills into workspace via clawhub CLI.
-
-    Args:
-        skills: list of skill dicts with 'slug', 'name', 'score', 'description'
-        workspace_dir: target workspace directory
-        interactive: whether to prompt user for confirmation
-
-    Returns:
-        list of successfully installed skill dicts
-    """
-    if not skills:
-        return []
-
-    has_clawhub = _clawhub_available()
-
-    # Display recommendations
-    print()
-    print("🔍 找到以下推荐 Skill：")
-    for i, skill in enumerate(skills):
-        score_str = f"⭐{skill['score']:.1f}" if skill.get("score") else ""
-        desc = skill.get("description", "")
-        if len(desc) > 60:
-            desc = desc[:57] + "..."
-        marker = "✅" if skill["score"] >= 3.5 else "⚠️"
-        optional = " [可选]" if skill["score"] < 3.3 else ""
-        print(f"  {i + 1}. {marker} {skill['slug']} ({score_str}) — {desc}{optional}")
-
-    # Check conflicts
-    warnings = _check_skill_conflicts(skills)
-    if warnings:
-        print()
-        for w in warnings:
-            print(f"  {w}")
-
-    if not has_clawhub:
-        print()
-        print("⚠️  clawhub CLI 未安装，无法自动安装 Skill。")
-        print("   安装 clawhub 后手动安装：")
-        for skill in skills:
-            print(f"     clawhub install {skill['slug']} --workdir {workspace_dir}")
-        return []
-
-    # User confirmation
-    selected = skills  # default: install all
-    if interactive:
-        print()
-        choice = input("安装以上 Skill？[Y/n/输入编号如 1,3] ").strip()
-        if choice.lower() == "n":
-            print("  跳过 Skill 安装")
-            return []
-        elif choice and choice.lower() != "y":
-            # Parse selection numbers
-            try:
-                indices = [int(x.strip()) - 1 for x in choice.split(",")]
-                selected = [skills[i] for i in indices if 0 <= i < len(skills)]
-            except (ValueError, IndexError):
-                print("  ⚠️  无效选择，安装全部推荐 Skill")
-                selected = skills
-
-    # Install
-    installed = []
-    print()
-    for skill in selected:
-        slug = skill["slug"]
-        print(f"  📦 安装 {slug}...", end=" ", flush=True)
-        try:
-            result = subprocess.run(
-                ["clawhub", "install", slug, "--force", "--workdir", workspace_dir],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            if result.returncode == 0:
-                print("✅")
-                installed.append(skill)
-            else:
-                err = result.stderr.strip() or result.stdout.strip()
-                print(f"❌ ({err[:80]})")
-        except subprocess.TimeoutExpired:
-            print("❌ (超时)")
-        except Exception as e:
-            print(f"❌ ({e})")
-
-    return installed
 
 
 _ANALYZE_PROMPT = """你是 OpenClaw Agent 市场的 Agent 设计专家。
@@ -1065,7 +1536,6 @@ _ANALYZE_PROMPT = """你是 OpenClaw Agent 市场的 Agent 设计专家。
   "experience": "经验描述，如 10+ 年...",
   "capabilities": ["能力1", "能力2", "能力3"],
   "style": "工作风格，如 严谨、自动化优先",
-  "skill_keywords": ["English skill keywords for ClawHub search, e.g. docker, web-search, copywriting"],
   "tools_needed": ["exec", "web_search", "web_fetch", "browser", "read", "write"],
   "examples": [
     {{"title": "示例标题", "input": "用户会说的话（详细）", "output": "Agent 的完整回复（详细，100字以上）"}},
@@ -1079,8 +1549,7 @@ _ANALYZE_PROMPT = """你是 OpenClaw Agent 市场的 Agent 设计专家。
 2. examples 至少 3 组，input 和 output 都要详细真实
 3. tools_needed 从 OpenClaw 可用工具中选择：exec, web_search, web_fetch, browser, read, write, edit, image, pdf, tts, nodes, message
 4. name 用英文小写+短横线
-5. 风格要鲜明有个性
-6. skill_keywords MUST be in English (ClawHub is English-based), e.g. social-media-marketing, web-search, copywriting, docker, summarize"""
+5. 风格要鲜明有个性"""
 
 _SOUL_PROMPT = """你是 OpenClaw Agent Workspace 配置专家。根据以下 Agent Spec 生成 SOUL.md 文件内容。
 
@@ -1147,23 +1616,40 @@ Agent Spec：
 6. 用中文书写"""
 
 
-def _openai_chat(messages: list, json_mode: bool = False, max_retries: int = 2) -> str:
-    """Call OpenAI chat completions API using urllib (no deps)."""
-    import urllib.request
-
-    api_key = os.environ.get("OPENAI_API_KEY", "")
+def _get_llm_config() -> dict:
+    """Get LLM configuration from environment variables with sensible defaults."""
+    model = os.environ.get("LOBSTER_MODEL", "gpt-4o-mini")
+    api_base = os.environ.get("LOBSTER_API_BASE", "https://api.openai.com/v1")
+    api_key = os.environ.get("LOBSTER_API_KEY", "") or os.environ.get(
+        "OPENAI_API_KEY", ""
+    )
     if not api_key:
         # Try loading from lobster token
         token_data = _load_token()
         if token_data:
             api_key = token_data.get("openai_key", "")
+    return {"model": model, "api_base": api_base.rstrip("/"), "api_key": api_key}
+
+
+def _openai_chat(messages: list, json_mode: bool = False, max_retries: int = 2) -> str:
+    """Call OpenAI-compatible chat completions API using urllib (no deps).
+
+    Supports configuration via environment variables:
+      LOBSTER_MODEL    — model name (default: gpt-4o-mini)
+      LOBSTER_API_BASE — API base URL (default: https://api.openai.com/v1)
+      LOBSTER_API_KEY  — API key (fallback: OPENAI_API_KEY)
+    """
+
+    llm_cfg = _get_llm_config()
+    api_key = llm_cfg["api_key"]
     if not api_key:
-        print("❌ 未设置 OPENAI_API_KEY 环境变量")
-        print("   请运行: export OPENAI_API_KEY='sk-...'")
+        print("❌ 未设置 API Key 环境变量")
+        print("   请运行: export LOBSTER_API_KEY='sk-...'")
+        print("   或者:   export OPENAI_API_KEY='sk-...'")
         sys.exit(1)
 
     body = {
-        "model": "gpt-4o-mini",
+        "model": llm_cfg["model"],
         "messages": messages,
         "temperature": 0.7,
     }
@@ -1176,10 +1662,12 @@ def _openai_chat(messages: list, json_mode: bool = False, max_retries: int = 2) 
         "Authorization": f"Bearer {api_key}",
     }
 
+    api_url = f"{llm_cfg['api_base']}/chat/completions"
+
     for attempt in range(max_retries):
         try:
             req = urllib.request.Request(
-                "https://api.openai.com/v1/chat/completions",
+                api_url,
                 data=data,
                 headers=headers,
                 method="POST",
@@ -1192,7 +1680,7 @@ def _openai_chat(messages: list, json_mode: bool = False, max_retries: int = 2) 
                 print(f"  ⚠️  API 调用失败，重试中... ({e})")
                 time.sleep(2)
             else:
-                print(f"❌ OpenAI API 调用失败: {e}")
+                print(f"❌ LLM API 调用失败: {e}")
                 sys.exit(1)
     return ""
 
@@ -1260,7 +1748,7 @@ def _generate_soul(spec: dict) -> str:
     return content
 
 
-def _generate_workspace(spec: dict, output_dir: str, interactive: bool = True):
+def _generate_workspace(spec: dict, output_dir: str):
     """Generate complete workspace directory from Agent Spec."""
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -1376,51 +1864,19 @@ _(随着使用逐步积累)_
     (out / "MEMORY.md").write_text(memory_md, encoding="utf-8")
     print("  ✅ MEMORY.md")
 
-    # --- Skill Search & Install ---
-    installed_skills = []
-    skill_keywords = spec.get("skill_keywords", [])
-    if skill_keywords and _clawhub_available():
-        print()
-        print(f"🔍 [Skill] 根据关键词搜索 ClawHub: {', '.join(skill_keywords)}")
-        search_results = _search_skills(skill_keywords, limit=3)
-        if search_results:
-            # Filter to top relevant results (score >= 3.0)
-            relevant = [s for s in search_results if s.get("score", 0) >= 3.0][:8]
-            if relevant:
-                installed_skills = _install_skills(
-                    relevant, output_dir, interactive=interactive
-                )
-                if installed_skills:
-                    print(f"  ✅ 已安装 {len(installed_skills)} 个 Skill")
-                else:
-                    print("  ℹ️  未安装任何 Skill")
-            else:
-                print("  ℹ️  未找到高相关度的 Skill")
-        else:
-            print("  ℹ️  搜索无结果")
-    elif skill_keywords and not _clawhub_available():
-        print()
-        print("⚠️  clawhub CLI 未安装，跳过 Skill 自动安装")
-        print("   推荐 Skill 关键词：", ", ".join(skill_keywords))
-        print("   安装 clawhub 后手动安装：")
-        for kw in skill_keywords:
-            print(f"     clawhub search {kw}")
-
     # --- agent-config.yaml ---
-    _generate_agent_config(spec, output_dir, installed_skills=installed_skills)
+    _generate_agent_config(spec, output_dir)
+    # Write avatar_emoji into agent-config.yaml if LLM generated an emoji
+    if spec.get("emoji"):
+        config_path = out / "agent-config.yaml"
+        existing = config_path.read_text(encoding="utf-8")
+        existing += f"\n# Avatar emoji（register 时自动生成头像）\navatar_emoji: {json.dumps(spec['emoji'], ensure_ascii=False)}\n"
+        config_path.write_text(existing, encoding="utf-8")
     print("  ✅ agent-config.yaml")
-
-    skills_dir = out / "skills"
-    installed_count = len(list(skills_dir.iterdir())) if skills_dir.exists() else 0
-    if installed_count > 0:
-        print(f"  ✅ skills/ ({installed_count} 个 Skill 已安装)")
-    else:
-        print("  ✅ skills/ (空目录)")
+    print("  ✅ skills/ (空目录)")
 
 
-def _generate_agent_config(
-    spec: dict, output_dir: str, installed_skills: Optional[list] = None
-):
+def _generate_agent_config(spec: dict, output_dir: str):
     """Generate agent-config.yaml compatible with register command."""
     out = Path(output_dir)
     config = {
@@ -1436,19 +1892,19 @@ def _generate_agent_config(
     }
     _write_config_yaml(out / "agent-config.yaml", config)
 
-    # Append skills section if skills were installed
-    if installed_skills:
-        config_path = out / "agent-config.yaml"
-        existing = config_path.read_text(encoding="utf-8")
-        skills_lines = ["\n# 已安装的 Skill", "skills:"]
-        for skill in installed_skills:
-            skills_lines.append(f"  - name: {skill['slug']}")
-            desc = skill.get("description", skill.get("name", ""))
-            skills_lines.append(
-                f"    description: {json.dumps(desc, ensure_ascii=False)}"
-            )
-        existing += "\n".join(skills_lines) + "\n"
-        config_path.write_text(existing, encoding="utf-8")
+
+def _generate_avatar_data_url(emoji: str) -> str:
+    """Generate a simple SVG data URL with the given emoji as avatar."""
+    import base64
+
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">'
+        '<rect width="100" height="100" rx="20" fill="#f0f0f0"/>'
+        f'<text x="50" y="50" font-size="50" text-anchor="middle" dominant-baseline="central">{emoji}</text>'
+        "</svg>"
+    )
+    b64 = base64.b64encode(svg.encode("utf-8")).decode("ascii")
+    return f"data:image/svg+xml;base64,{b64}"
 
 
 def cmd_create(args):
@@ -1456,6 +1912,10 @@ def cmd_create(args):
     description = args.description
     output_dir = args.output
     name = args.name
+
+    # Print LLM configuration
+    llm_cfg = _get_llm_config()
+    print(f"🤖 使用模型: {llm_cfg['model']}  (API: {llm_cfg['api_base']})")
 
     # Interactive mode if no description
     if not description:
@@ -1508,9 +1968,6 @@ def cmd_create(args):
     print(f"  描述：{spec.get('description', '')[:60]}...")
     caps = spec.get("capabilities", [])
     print(f"  能力：{', '.join(caps)}")
-    skills = spec.get("skill_keywords", [])
-    if skills:
-        print(f"  推荐 Skill：{', '.join(skills)}")
     print(f"  示例：{len(spec.get('examples', []))} 组")
     print("═══════════════════════════════════════")
     print()
@@ -1522,23 +1979,16 @@ def cmd_create(args):
             print("已取消")
             return
 
-    # Step 2: Generate workspace + install skills
-    interactive = not args.yes
-    print(f"📁 [2/3] 生成 workspace → {output_dir}")
-    _generate_workspace(spec, output_dir, interactive=interactive)
+    # Step 2: Generate workspace files
+    print(f"📁 [2/3] 生成 workspace 文件 → {output_dir}")
+    _generate_workspace(spec, output_dir)
 
-    # Step 3: Summary
     print()
     print("🎉 [3/3] 生成完成！")
     print()
 
     # Build tree display
     out_path = Path(output_dir)
-    skills_dir = out_path / "skills"
-    installed_skills = []
-    if skills_dir.exists():
-        installed_skills = [d.name for d in skills_dir.iterdir() if d.is_dir()]
-
     print(f"  📂 {output_dir}/")
     print("  ├── IDENTITY.md")
     print("  ├── SOUL.md")
@@ -1547,29 +1997,17 @@ def cmd_create(args):
     print("  ├── USER.md")
     print("  ├── MEMORY.md")
     print("  ├── agent-config.yaml")
-    if installed_skills:
-        print("  └── skills/")
-        for i, s in enumerate(installed_skills):
-            connector = "└──" if i == len(installed_skills) - 1 else "├──"
-            print(f"      {connector} {s}/")
-    else:
-        print("  └── skills/")
+    print("  └── skills/")
     print()
     print(f"✅ Agent workspace 已生成：{output_dir}/")
     print()
     print("📋 下一步：")
     print("  1. 检查并调整 SOUL.md（核心人设定义）")
-    if not installed_skills:
-        print("  2. 安装推荐 Skill（如有）")
-    print(
-        f"  {'3' if not installed_skills else '2'}. 登录市场：python3 lobster.py login"
-    )
-    print(f"  {'4' if not installed_skills else '3'}. 注册上架：")
+    print("  2. 登录市场：python3 lobster.py login")
+    print("  3. 注册上架：")
     print(f"     cd {output_dir}")
     print("     python3 lobster.py register --config agent-config.yaml")
-    print(
-        f"  {'5' if not installed_skills else '4'}. 启动连接：python3 lobster.py connect"
-    )
+    print("  4. 启动连接：python3 lobster.py connect")
 
 
 # ---------------------------------------------------------------------------
@@ -1609,9 +2047,34 @@ def main():
     p_init.add_argument("--output", help=f"配置文件输出路径（默认 {DEFAULT_CONFIG}）")
 
     # register
-    p_register = subparsers.add_parser("register", help="注册 Agent 到龙虾市场")
+    p_register = subparsers.add_parser(
+        "register", help="注册/更新 Agent 并自动连接市场"
+    )
     p_register.add_argument("--config", help=f"配置文件路径（默认 {DEFAULT_CONFIG}）")
+    p_register.add_argument(
+        "--agent-id",
+        help="指定 Agent UUID 强制更新（默认从 ~/.lobster-market/agent.json 读取）",
+    )
+    p_register.add_argument(
+        "--workspace",
+        help="OpenClaw workspace 目录路径（读取 SOUL.md 等文件传给 API，用于 Fly 部署）",
+    )
     p_register.add_argument("--yes", "-y", action="store_true", help="跳过确认直接注册")
+    p_register.add_argument(
+        "--no-connect",
+        action="store_true",
+        help="仅注册，不自动连接市场（默认注册后自动连接，确保 QA 评测时 Agent 在线）",
+    )
+    p_register.add_argument(
+        "--port",
+        type=int,
+        help=f"自动连接时 Adapter 监听端口（默认 {DEFAULT_ADAPTER_PORT}）",
+    )
+    p_register.add_argument(
+        "--daemon",
+        action="store_true",
+        help="自动连接时后台运行（含守护重启）",
+    )
 
     # connect
     p_connect = subparsers.add_parser("connect", help="连接市场，开始接任务")
@@ -1621,13 +2084,34 @@ def main():
     p_connect.add_argument(
         "--port", type=int, help=f"Adapter 监听端口（默认 {DEFAULT_ADAPTER_PORT}）"
     )
-    p_connect.add_argument("--daemon", action="store_true", help="后台运行")
+    p_connect.add_argument(
+        "--daemon", action="store_true", help="后台运行（含自动守护重启）"
+    )
+    p_connect.add_argument("--stop", action="store_true", help="停止后台运行的进程")
+    p_connect.add_argument(
+        "--health-timeout",
+        type=int,
+        default=30,
+        dest="health_timeout",
+        help="Adapter 健康检查等待秒数（默认 30，旧版为 10）",
+    )
 
     # status
     p_status = subparsers.add_parser("status", help="查看连接/审核/评级状态")
     p_status.add_argument(
         "--agent-id", help="Agent UUID（默认从 ~/.lobster-market/agent.json 读取）"
     )
+
+    # push (T-854)
+    p_push = subparsers.add_parser("push", help="打包并上传 workspace skills 到平台")
+    p_push.add_argument(
+        "--agent-id", help="Agent UUID（默认从 ~/.lobster-market/agent.json 读取）"
+    )
+    p_push.add_argument(
+        "--workspace", help="OpenClaw workspace 路径（默认从 agent-config.yaml 读取）"
+    )
+    p_push.add_argument("--config", help=f"配置文件路径（默认 {DEFAULT_CONFIG}）")
+    p_push.add_argument("--yes", "-y", action="store_true", help="跳过确认直接上传")
 
     # create
     p_create = subparsers.add_parser(
@@ -1654,6 +2138,7 @@ def main():
         "register": cmd_register,
         "connect": cmd_connect,
         "status": cmd_status,
+        "push": cmd_push,
         "create": cmd_create,
     }
 

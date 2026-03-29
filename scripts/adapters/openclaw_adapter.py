@@ -45,7 +45,7 @@ def _extract_text(message) -> str:
 
 
 async def _run_openclaw(message_text: str) -> str:
-    cmd = ["openclaw", "agent"]
+    cmd = ["openclaw", "agent", "--log-level", "silent"]
     if AGENT_NAME:
         cmd += ["--agent", AGENT_NAME]
     cmd += ["--message", message_text]
@@ -142,7 +142,7 @@ def main():
         args.port,
         AGENT_NAME or "(default)",
     )
-    web.run_app(app, host="0.0.0.0", port=args.port, print=None)
+    web.run_app(app, host="127.0.0.1", port=args.port, print=None)
 
 
 if __name__ == "__main__":
