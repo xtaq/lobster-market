@@ -23,6 +23,9 @@ import os
 import re
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,6 +50,93 @@ log = logging.getLogger("openclaw-adapter")
 AGENT_NAME = ""
 AGENT_ID = ""
 TOKEN = ""
+
+# Token 自动刷新相关
+TOKEN_FILE = Path.home() / ".lobster-market" / "token.json"
+_TOKEN_REFRESH_BUFFER = 120  # 提前 2 分钟刷新
+_REFRESH_HOST = "mindcore8.com"
+
+
+def _get_fresh_token() -> str:
+    """每次调用时获取最新 token，过期前自动刷新。
+    
+    优先从 token.json 读取（market-connect 也会刷新写入同一文件），
+    如果即将过期则主动刷新。回退到全局 TOKEN。
+    """
+    global TOKEN
+    
+    # 尝试从文件读取最新 token
+    try:
+        data = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+        access_token = data.get("access_token", "")
+    except Exception:
+        return TOKEN  # 文件读取失败，用全局缓存
+    
+    if not access_token:
+        return TOKEN
+    
+    # 解析 JWT 检查过期时间
+    try:
+        payload_b64 = access_token.split(".")[1]
+        # 补齐 base64 padding
+        payload_b64 += "=" * (4 - len(payload_b64) % 4)
+        payload = json.loads(base64.b64decode(payload_b64))
+        remaining = payload.get("exp", 0) - int(time.time())
+    except Exception:
+        return access_token  # 解析失败，直接用
+    
+    if remaining > _TOKEN_REFRESH_BUFFER:
+        # token 还有效，更新全局缓存
+        TOKEN = access_token
+        return access_token
+    
+    # 即将过期，尝试刷新
+    log.info("⏳ Token 即将过期（剩余 %ds），自动刷新...", remaining)
+    try:
+        new_token = _do_token_refresh(data)
+        if new_token:
+            TOKEN = new_token
+            log.info("🔄 Token 自动刷新成功")
+            return new_token
+    except Exception as e:
+        log.warning("⚠️ Token 刷新失败: %s", e)
+    
+    # 刷新失败，返回当前 token（可能已过期但也只能试试）
+    return access_token
+
+
+def _do_token_refresh(token_data: dict) -> str | None:
+    """调用 /api/v1/auth/refresh 获取新 token 并写回文件。"""
+    refresh_token = token_data.get("refresh_token")
+    if not refresh_token:
+        log.warning("⚠️ 无 refresh_token，无法刷新")
+        return None
+    
+    host = token_data.get("host", _REFRESH_HOST)
+    req = urllib.request.Request(
+        f"https://{host}/api/v1/auth/refresh",
+        data=json.dumps({"refresh_token": refresh_token}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+    
+    new_access = result.get("access_token")
+    if not new_access:
+        return None
+    
+    # 写回文件
+    token_data["access_token"] = new_access
+    if result.get("refresh_token"):
+        token_data["refresh_token"] = result["refresh_token"]
+    try:
+        TOKEN_FILE.write_text(json.dumps(token_data, indent=2), encoding="utf-8")
+        TOKEN_FILE.chmod(0o600)
+    except Exception as e:
+        log.warning("⚠️ 写入 token 文件失败: %s", e)
+    
+    return new_access
 
 # ---------------------------------------------------------------------------
 # T-908: 媒体上传集成
@@ -211,8 +301,10 @@ def _upload_single_sync(
 ) -> tuple[_PendingUpload, UploadedFile | None]:
     """同步上传单个文件，返回 (pending, uploaded_file_or_none)。"""
     uploader = _get_uploader()
+    # 每次上传前获取最新 token（自动刷新）
+    fresh_token = _get_fresh_token()
     try:
-        url = uploader.upload_file(pu.filepath, agent_id, token)
+        url = uploader.upload_file(pu.filepath, agent_id, fresh_token)
         if url:
             p = Path(pu.filepath)
             mime = _mt.guess_type(str(p))[0] or "application/octet-stream"
@@ -337,7 +429,7 @@ def _extract_text(message) -> str:
 
 
 async def _run_openclaw(message_text: str) -> str:
-    cmd = ["openclaw", "agent", "--log-level", "silent"]
+    cmd = ["openclaw", "agent"]
     if AGENT_NAME:
         cmd += ["--agent", AGENT_NAME]
     cmd += ["--message", message_text]
@@ -347,13 +439,21 @@ async def _run_openclaw(message_text: str) -> str:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=1200)
 
     if proc.returncode != 0:
-        err = stderr.decode().strip() or f"openclaw exit code {proc.returncode}"
+        err = stderr.decode().strip() or stdout.decode().strip() or f"openclaw exit code {proc.returncode}"
         raise RuntimeError(err)
 
-    return stdout.decode().strip()
+    # Filter out [plugins] and other noise lines from stdout
+    lines = stdout.decode().splitlines()
+    clean_lines = [
+        l for l in lines
+        if not l.startswith("[plugins]")
+        and not l.startswith("Require stack:")
+        and not l.startswith("- /")
+    ]
+    return "\n".join(clean_lines).strip()
 
 
 async def handle_execute(request):
@@ -420,7 +520,7 @@ async def handle_health(request):
         "status": "ok",
         "adapter": "openclaw",
         "agent": AGENT_NAME,
-        "media_upload": bool(AGENT_ID and TOKEN),
+        "media_upload": bool(AGENT_ID and (TOKEN or TOKEN_FILE.exists())),
     }
     # Try to detect workspace info
     try:
@@ -463,13 +563,27 @@ def main():
     TOKEN = os.environ.get("LOBSTER_TOKEN", "") or args.token
     AGENT_ID = os.environ.get("LOBSTER_AGENT_ID", "") or args.agent_id
 
-    if AGENT_ID and TOKEN:
-        log.info("📎 媒体上传已启用 (agent_id=%s…)", AGENT_ID[:8])
+    # 如果没传 token 但 token.json 存在，从文件读取
+    if not TOKEN and TOKEN_FILE.exists():
+        try:
+            td = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+            TOKEN = td.get("access_token", "")
+            if not AGENT_ID:
+                # 也尝试从 agent.json 读取 agent_id
+                agent_file = Path.home() / ".lobster-market" / "agent.json"
+                if agent_file.exists():
+                    AGENT_ID = json.loads(agent_file.read_text(encoding="utf-8")).get("agent_id", "")
+            log.info("📎 从 token.json 读取凭证（支持自动刷新）")
+        except Exception as e:
+            log.warning("⚠️ 读取 token.json 失败: %s", e)
+
+    if AGENT_ID and (TOKEN or TOKEN_FILE.exists()):
+        log.info("📎 媒体上传已启用 (agent_id=%s…, auto_refresh=True)", AGENT_ID[:8])
     else:
         missing = []
         if not AGENT_ID:
             missing.append("agent-id")
-        if not TOKEN:
+        if not TOKEN and not TOKEN_FILE.exists():
             missing.append("token")
         log.info(
             "📎 媒体上传未启用（缺少 %s），Agent 输出中的本地文件路径将保持原样",

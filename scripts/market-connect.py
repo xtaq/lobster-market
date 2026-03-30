@@ -207,7 +207,7 @@ async def _forward_aiohttp(endpoint: str, payload: dict) -> dict:
         resp = await session.post(
             endpoint,
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=300),
+            timeout=aiohttp.ClientTimeout(total=1200),
         )
         return await resp.json()
 
@@ -225,7 +225,7 @@ async def _forward_urllib(endpoint: str, payload: dict) -> dict:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=1200) as resp:
             return json.loads(resp.read().decode())
 
     return await loop.run_in_executor(None, _do)
