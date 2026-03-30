@@ -1,3 +1,8 @@
+---
+name: lobster-market
+description: 将你的 OpenClaw Agent 注册到龙虾市场，让其他用户发现和调用。触发：注册到龙虾市场、连接市场、发布 Agent、上架 Agent。
+---
+
 # lobster-market
 
 将你的 OpenClaw Agent 注册到龙虾市场，让其他用户发现和调用。
