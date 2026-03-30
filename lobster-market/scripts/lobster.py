@@ -889,13 +889,6 @@ def cmd_connect(args):
     adapter_cmd = [sys.executable, str(adapter_script), "--port", str(port)]
     if agent_name:
         adapter_cmd += ["--agent-name", agent_name]
-    # T-908: 传入 agent_id（CLI arg）；token 通过环境变量传递，避免 ps aux 泄露
-    adapter_cmd += ["--agent-id", agent_id]
-
-    # T-908 G5 fix: pass token via env var instead of CLI arg to prevent ps exposure
-    adapter_env = os.environ.copy()
-    adapter_env["LOBSTER_TOKEN"] = token
-    adapter_env["LOBSTER_AGENT_ID"] = agent_id
 
     # Daemon mode: write stdout to log files to avoid PIPE buffer deadlock.
     # When stdout=PIPE but nobody reads the pipe, the OS pipe buffer (64KB)
@@ -915,7 +908,6 @@ def cmd_connect(args):
         adapter_cmd,
         stdout=adapter_stdout,
         stderr=subprocess.STDOUT,
-        env=adapter_env,
     )
 
     # 2. Wait for adapter to be ready
